@@ -1,0 +1,11 @@
+{
+  "name": "meusdomus-tinkoff",
+  "version": "1.0.0",
+  "main": "tinkoff-server.js",
+  "scripts": {
+    "start": "node tinkoff-server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
