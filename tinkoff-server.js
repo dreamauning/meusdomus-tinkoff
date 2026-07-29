@@ -77,15 +77,24 @@ app.post('/tinkoff/init', async (req, res) => {
       return res.status(400).json({ error: 'Некорректные данные заказа' });
     }
 
-    // TODO: здесь же сохраните заказ в свою базу/таблицу/CRM —
-    // это единственное место, где заказ реально фиксируется как "оплачивается"
+    // ВАЖНО: явно передаём SuccessURL/FailURL/NotificationURL прямо в запросе —
+    // так сайт полностью контролирует, куда вернуть покупателя, и не зависит
+    // от того, правильно ли эти адреса настроены (или настроены ли вообще)
+    // в личном кабинете Тинькофф. Согласно документации банка, если эти
+    // параметры переданы в запросе — используются именно они, а не настройки
+    // терминала.
+    const SITE_URL = 'https://meusdomus.ru';
+    const SERVER_URL = 'https://meusdomus-tinkoff.onrender.com'; // адрес ЭТОГО сервера
 
     const initParams = {
       TerminalKey: TERMINAL_KEY,
       Amount: Math.round(amount * 100), // Тинькофф считает в копейках
       OrderId: orderNumber,
       Description: 'Заказ Meus Domus ' + orderNumber,
-      DATA: { Phone: customerPhone || '', Name: customerName || '' }
+      DATA: { Phone: customerPhone || '', Name: customerName || '' },
+      SuccessURL: SITE_URL + '/?payment=success',
+      FailURL: SITE_URL + '/?payment=fail',
+      NotificationURL: SERVER_URL + '/tinkoff/notify'
     };
     const token = buildToken(initParams);
 
