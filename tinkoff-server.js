@@ -55,6 +55,34 @@ app.use(express.json());
 const TERMINAL_KEY = '1785336284647';
 const TERMINAL_PASSWORD = '2ir^%&_X35q$iWt_';
 
+// Тот же адрес Google-скрипта, что использует сайт (MD_PRODUCTS_FEED_URL
+// в Блоке 3) — нужен, чтобы записать заказ в таблицу НАДЁЖНО, по факту
+// подтверждения оплаты банком, а не полагаясь на то, что браузер
+// покупателя успешно вернётся на сайт и сам всё отправит.
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
+
+/* ==================== НАДЁЖНАЯ ЗАПИСЬ ЗАКАЗА ПО ВЕБХУКУ =====================
+ * НАЙДЕНА АРХИТЕКТУРНАЯ ПРИЧИНА пропадающих заказов: запись в таблицу,
+ * письмо клиенту и уведомление в Telegram раньше запускались ТОЛЬКО из
+ * браузера покупателя, уже ПОСЛЕ того как он вернулся на сайт с оплаты.
+ * Если браузер по любой причине не смог это сделать (очистилось
+ * хранилище, вкладка закрылась, оборвалась сеть) — заказ просто исчезал,
+ * хотя деньги уже были списаны и банк это подтвердил.
+ * Теперь при создании платежа (/tinkoff/init) сервер сохраняет у СЕБЯ
+ * полные данные заказа, и когда приходит вебхук с подтверждением оплаты
+ * (/tinkoff/notify) — сервер САМ отправляет заказ в таблицу, независимо
+ * от того, что происходит в браузере покупателя в этот момент. Браузер
+ * тоже продолжает пытаться это сделать (как раньше) — это не мешает,
+ * а просто дублирует подстраховку; Apps Script сам не даст записать
+ * один и тот же заказ дважды (проверка по номеру заказа).
+ * Ограничение: это простое хранилище "в памяти" сервера — если сам
+ * сервер перезапустится в узкое окно между созданием платежа и приходом
+ * вебхука (обычно это секунды-минуты), данные будут потеряны и сработает
+ * только "подстраховка" со стороны браузера. Для магазина такого размера
+ * это разумный компромисс: не требует отдельной базы данных ради
+ * редкого пересечения по времени. */
+const pendingOrders = {};
+
 /* ==================== РОССИЙСКИЙ СЕРТИФИКАТ МИНЦИФРЫ ====================
  * НАЙДЕНА ТОЧНАЯ ПРИЧИНА ошибки "self-signed certificate in certificate
  * chain": согласно официальной документации Т-Банка
@@ -218,11 +246,27 @@ function postJson(url, bodyObj) {
 // 1) Приём заказа с сайта → создание платежа в Тинькофф → отдаём ссылку на оплату
 app.post('/tinkoff/init', async (req, res) => {
   try {
-    const { orderNumber, amount, customerName, customerPhone, items } = req.body;
+    const {
+      orderNumber, amount, customerName, customerPhone, customerEmail, comment,
+      delivery, deliveryLabel, deliveryDestination, items,
+      weightGrams, dimensionsCm, ozonDeliveryPointId
+    } = req.body;
 
     if (!orderNumber || !amount || amount <= 0) {
       return res.status(400).json({ error: 'Некорректные данные заказа' });
     }
+
+    // Сохраняем ВСЁ, что понадобится для записи заказа в таблицу — до
+    // того, как покупатель вообще увидит страницу оплаты. Если вебхук
+    // подтвердит оплату, у нас уже есть все данные под рукой, не нужно
+    // ничего запрашивать у браузера покупателя.
+    pendingOrders[orderNumber] = {
+      orderNumber, phone: customerPhone || '', name: customerName || '', email: customerEmail || '',
+      total: amount, items: items || [], delivery: deliveryLabel || delivery || '',
+      deliveryDestination: deliveryDestination || '', comment: comment || '',
+      weightGrams: weightGrams || null, dimensionsCm: dimensionsCm || null,
+      ozonDeliveryPointId: ozonDeliveryPointId || null
+    };
 
     const SITE_URL = 'https://meusdomus.ru';
     const SERVER_URL = 'https://meusdomus-tinkoff.onrender.com';
@@ -312,14 +356,57 @@ app.post('/tinkoff/notify', (req, res) => {
   }
 
   if (body.Status === 'CONFIRMED') {
-    // TODO: пометить заказ body.OrderId как оплаченный в вашей базе/таблице,
-    // отправить уведомление себе (email/Telegram) о новом оплаченном заказе
     console.log('Оплачен заказ:', body.OrderId, 'сумма:', body.Amount / 100);
+    // ВАЖНО: отвечаем банку "OK" СРАЗУ (ниже), не дожидаясь записи в
+    // таблицу — Тинькофф ждёт быстрый ответ на вебхук и может посчитать
+    // его неудачным (и прислать повторно) при заметной задержке. Саму
+    // запись запускаем в фоне, не блокируя ответ банку.
+    saveConfirmedOrderReliably(body.OrderId).catch(err => {
+      console.error('Не удалось записать заказ по вебхуку:', body.OrderId, err.message || err);
+    });
   }
 
   // Тинькофф ждёт именно текст "OK" в ответ
   res.send('OK');
 });
+
+/**
+ * Отправляет подтверждённый заказ в Google Таблицу — используя данные,
+ * сохранённые ещё на шаге /tinkoff/init (до того, как покупатель вообще
+ * увидел форму оплаты). Работает полностью независимо от браузера
+ * покупателя — единственный источник правды здесь banк, не браузер.
+ * Apps Script сам защищён от повторной записи одного и того же номера
+ * заказа — можно не бояться, что этот путь и обычный (из браузера)
+ * запишут заказ дважды.
+ */
+async function saveConfirmedOrderReliably(orderId) {
+  const pending = pendingOrders[orderId];
+  if (!pending) {
+    // Сервер перезапускался между /init и этим вебхуком (см. пояснение
+    // выше про ограничение "хранилища в памяти") — тогда полагаемся на
+    // то, что браузер покупателя сам отправит заказ при возврате на сайт.
+    console.warn('Нет сохранённых данных для заказа (сервер мог перезапуститься):', orderId);
+    return;
+  }
+
+  await postJson(APPS_SCRIPT_URL, {
+    type: 'order',
+    orderNumber: pending.orderNumber,
+    phone: pending.phone,
+    name: pending.name,
+    email: pending.email,
+    total: pending.total,
+    items: pending.items,
+    delivery: pending.delivery,
+    deliveryDestination: pending.deliveryDestination,
+    comment: pending.comment,
+    weightGrams: pending.weightGrams,
+    dimensionsCm: pending.dimensionsCm,
+    ozonDeliveryPointId: pending.ozonDeliveryPointId
+  });
+
+  delete pendingOrders[orderId]; // больше не нужно хранить — заказ успешно записан
+}
 
 // Простой диагностический маршрут — открыв его в браузере, можно быстро
 // проверить, что сервис вообще жив и отвечает (без обращения к Тинькофф)
