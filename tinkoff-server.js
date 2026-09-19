@@ -249,7 +249,7 @@ app.post('/tinkoff/init', async (req, res) => {
     const {
       orderNumber, amount, customerName, customerPhone, customerEmail, comment,
       delivery, deliveryLabel, deliveryDestination, items,
-      weightGrams, dimensionsCm, ozonDeliveryPointId
+      weightGrams, dimensionsCm, ozonDeliveryPointId, cdekDeliveryPointCode
     } = req.body;
 
     if (!orderNumber || !amount || amount <= 0) {
@@ -265,7 +265,7 @@ app.post('/tinkoff/init', async (req, res) => {
       total: amount, items: items || [], delivery: deliveryLabel || delivery || '',
       deliveryDestination: deliveryDestination || '', comment: comment || '',
       weightGrams: weightGrams || null, dimensionsCm: dimensionsCm || null,
-      ozonDeliveryPointId: ozonDeliveryPointId || null
+      ozonDeliveryPointId: ozonDeliveryPointId || null, cdekDeliveryPointCode: cdekDeliveryPointCode || null
     };
 
     const SITE_URL = 'https://meusdomus.ru';
@@ -402,7 +402,8 @@ async function saveConfirmedOrderReliably(orderId) {
     comment: pending.comment,
     weightGrams: pending.weightGrams,
     dimensionsCm: pending.dimensionsCm,
-    ozonDeliveryPointId: pending.ozonDeliveryPointId
+    ozonDeliveryPointId: pending.ozonDeliveryPointId,
+    cdekDeliveryPointCode: pending.cdekDeliveryPointCode
   });
 
   delete pendingOrders[orderId]; // больше не нужно хранить — заказ успешно записан
