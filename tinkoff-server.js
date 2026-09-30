@@ -1,102 +1,19 @@
-/**
- * СЕРВЕР ДЛЯ ПРИЁМА ОПЛАТЫ ЧЕРЕЗ ТИНЬКОФФ КАССУ (Т-Kassa / Тинькофф Бизнес)
- * ---------------------------------------------------------------------
- * ПОЧЕМУ ЭТО НЕЛЬЗЯ СДЕЛАТЬ ПРЯМО НА САЙТЕ В TILDA:
- * У терминала Тинькофф Кассы есть TerminalKey (публичный, не секрет)
- * и Password (СЕКРЕТНЫЙ пароль терминала). Password участвует в подписи
- * каждого запроса. Если положить Password в код сайта — его увидит
- * любой человек через "Просмотр кода страницы" и сможет создавать
- * платежи или подделывать подтверждения от вашего имени. Поэтому
- * Password должен жить только на сервере, а не в браузере.
- *
- * ==================== ЧТО ИЗМЕНИЛОСЬ В ЭТОЙ ВЕРСИИ ====================
- * Была найдена вероятная причина ошибки "не удалось связаться с сервером
- * оплаты": предыдущая версия использовала встроенный fetch() — он
- * появился в Node.js только начиная с версии 18. Если сервис на Render
- * был создан ещё до этого (или Node-версия там почему-то более старая),
- * вызов fetch() падает с ошибкой ДО того, как что-либо отправляется в
- * Тинькофф. Из-за этого клиенту вместо чистого JSON-ответа прилетает
- * страница-заглушка об ошибке — браузер не может её разобрать как JSON,
- * и это выглядит как "не удалось связаться", хотя на самом деле сервер
- * просто упал на пустом месте.
- * Починено так, чтобы это в принципе не могло повториться: вместо fetch()
- * теперь используется встроенный модуль Node.js "https" — он работает
- * абсолютно на любой версии Node, никаких внешних условий и подводных
- * камней с версией платформы. Дополнительно ниже в package.json
- * явно прописана нужная версия Node — на случай, если Render всё же
- * учитывает эту настройку при следующем деплое.
- * ========================================================================
- *
- * ГДЕ ЗАПУСТИТЬ ЭТОТ КОД (без своего физического сервера):
- * - Yandex Cloud Functions / Timeweb Cloud Apps / Vercel / Render —
- *   у всех есть бесплатный или недорогой тариф, деплой за 10 минут.
- *
- * ЧТО НУЖНО ПОЛУЧИТЬ У ТИНЬКОФФ:
- * 1. Подключить приём платежей в Тинькофф Бизнес → выдадут TerminalKey и Password.
- * 2. В личном кабинете указать:
- *    - Notification URL — https://ваш-сервер/tinkoff/notify
- *    - Success URL       — https://meusdomus.ru/?payment=success
- *    - Fail URL          — https://meusdomus.ru/?payment=fail
- *
- * ТЕКУЩИЙ СТАТУС: боевые ключи подключены, сайт принимает настоящие деньги.
- *
- * УСТАНОВКА ЗАВИСИМОСТЕЙ: npm init -y && npm install express
- * (модуль https — встроенный в Node.js, ставить отдельно не нужно)
- */
-
 const express = require('express');
 const crypto = require('crypto');
 const https = require('https');
 const tls = require('tls');
+
+const TERMINAL_KEY = '1785336284647';
+const TERMINAL_PASSWORD = '2ir^%&_X35q$iWt_';
+const SITE_URL = 'https://meusdomus.ru';
+const SERVER_URL = 'https://meusdomus-tinkoff.onrender.com';
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
+
 const app = express();
 app.use(express.json());
 
-// БОЕВЫЕ КЛЮЧИ — принимаем настоящие деньги:
-const TERMINAL_KEY = '1785336284647';
-const TERMINAL_PASSWORD = '2ir^%&_X35q$iWt_';
-
-// Тот же адрес Google-скрипта, что использует сайт (MD_PRODUCTS_FEED_URL
-// в Блоке 3) — нужен, чтобы записать заказ в таблицу НАДЁЖНО, по факту
-// подтверждения оплаты банком, а не полагаясь на то, что браузер
-// покупателя успешно вернётся на сайт и сам всё отправит.
-const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
-
-/* ==================== НАДЁЖНАЯ ЗАПИСЬ ЗАКАЗА ПО ВЕБХУКУ =====================
- * НАЙДЕНА АРХИТЕКТУРНАЯ ПРИЧИНА пропадающих заказов: запись в таблицу,
- * письмо клиенту и уведомление в Telegram раньше запускались ТОЛЬКО из
- * браузера покупателя, уже ПОСЛЕ того как он вернулся на сайт с оплаты.
- * Если браузер по любой причине не смог это сделать (очистилось
- * хранилище, вкладка закрылась, оборвалась сеть) — заказ просто исчезал,
- * хотя деньги уже были списаны и банк это подтвердил.
- * Теперь при создании платежа (/tinkoff/init) сервер сохраняет у СЕБЯ
- * полные данные заказа, и когда приходит вебхук с подтверждением оплаты
- * (/tinkoff/notify) — сервер САМ отправляет заказ в таблицу, независимо
- * от того, что происходит в браузере покупателя в этот момент. Браузер
- * тоже продолжает пытаться это сделать (как раньше) — это не мешает,
- * а просто дублирует подстраховку; Apps Script сам не даст записать
- * один и тот же заказ дважды (проверка по номеру заказа).
- * Ограничение: это простое хранилище "в памяти" сервера — если сам
- * сервер перезапустится в узкое окно между созданием платежа и приходом
- * вебхука (обычно это секунды-минуты), данные будут потеряны и сработает
- * только "подстраховка" со стороны браузера. Для магазина такого размера
- * это разумный компромисс: не требует отдельной базы данных ради
- * редкого пересечения по времени. */
 const pendingOrders = {};
 
-/* ==================== РОССИЙСКИЙ СЕРТИФИКАТ МИНЦИФРЫ ====================
- * НАЙДЕНА ТОЧНАЯ ПРИЧИНА ошибки "self-signed certificate in certificate
- * chain": согласно официальной документации Т-Банка
- * (developer.tbank.ru/eacq/intro/certificates/migration-russian-trusted-ca),
- * банк переходит с международных сертификатов GlobalSign (которые могут
- * быть отозваны из-за ужесточения правил CA/Browser Forum) на российский
- * национальный сертификат — Russian Trusted CA (Минцифры России). Node.js
- * не доверяет этому сертификату "из коробки", поэтому запрос к Тинькофф
- * падает ещё до того, как уходит к банку.
- * Ниже — официальные корневой (Root) и промежуточный (Sub) сертификаты
- * Минцифры, ДОБАВЛЕННЫЕ к стандартному списку доверенных центров Node.js
- * (не заменяющие его) — так сервер продолжит доверять и обычным мировым
- * сертификатам (на случай, если Тинькофф ещё не до конца переключился),
- * и новому российскому. */
 const RUSSIAN_TRUSTED_ROOT_CA = `-----BEGIN CERTIFICATE-----
 MIIFwjCCA6qgAwIBAgICEAAwDQYJKoZIhvcNAQELBQAwcDELMAkGA1UEBhMCUlUx
 PzA9BgNVBAoMNlRoZSBNaW5pc3RyeSBvZiBEaWdpdGFsIERldmVsb3BtZW50IGFu
@@ -173,24 +90,16 @@ GcyIdu7yNMMRihGVZCYr8rYiJoKiOzDqOkPkLOPdhtVlgnhowzHDxMHND/E2WA5p
 ZHuNM/m0TXt2wTTPL7JH2YC0gPz/BvvSzjksgzU5rLbRyUKQkgU=
 -----END CERTIFICATE-----`;
 
-// Полный список доверенных сертификатов для запросов к Тинькофф: обычные
-// мировые (встроенные в Node.js по умолчанию) + два российских сверху —
-// ДОБАВЛЯЕМ, а не заменяем, чтобы не потерять доверие к текущему
-// сертификату GlobalSign, если банк ещё не завершил переключение.
 const TINKOFF_TRUSTED_CA = [...tls.rootCertificates, RUSSIAN_TRUSTED_ROOT_CA, RUSSIAN_TRUSTED_SUB_CA];
 
-// Разрешаем запросы с вашего сайта
 app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', 'https://meusdomus.ru');
+  res.setHeader('Access-Control-Allow-Origin', SITE_URL);
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
-// Подпись запроса по алгоритму Тинькофф: берём плоские поля запроса
-// (без вложенных объектов/массивов), добавляем Password, сортируем по
-// ключу, склеиваем значения и хэшируем SHA-256.
 function buildToken(params) {
   const flat = { ...params, Password: TERMINAL_PASSWORD };
   const keys = Object.keys(flat)
@@ -200,10 +109,6 @@ function buildToken(params) {
   return crypto.createHash('sha256').update(concatenated).digest('hex');
 }
 
-// Замена fetch() на встроенный https-модуль — работает на любой версии
-// Node.js без исключений. Возвращает Promise с уже распарсенным JSON,
-// чтобы остальной код ниже мог продолжать работать точно так же, как
-// раньше (await postJson(...)), без переписывания логики вокруг него.
 function postJson(url, bodyObj) {
   return new Promise((resolve, reject) => {
     const bodyStr = JSON.stringify(bodyObj);
@@ -216,8 +121,8 @@ function postJson(url, bodyObj) {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(bodyStr)
       },
-      ca: TINKOFF_TRUSTED_CA, // мировые CA + российский Минцифры — см. пояснение выше
-      timeout: 15000 // 15 секунд — банк обычно отвечает быстрее, но подстрахуемся от зависания
+      ca: TINKOFF_TRUSTED_CA,
+      timeout: 15000
     };
 
     const request = https.request(options, (response) => {
@@ -243,7 +148,6 @@ function postJson(url, bodyObj) {
   });
 }
 
-// 1) Приём заказа с сайта → создание платежа в Тинькофф → отдаём ссылку на оплату
 app.post('/tinkoff/init', async (req, res) => {
   try {
     const {
@@ -256,10 +160,6 @@ app.post('/tinkoff/init', async (req, res) => {
       return res.status(400).json({ error: 'Некорректные данные заказа' });
     }
 
-    // Сохраняем ВСЁ, что понадобится для записи заказа в таблицу — до
-    // того, как покупатель вообще увидит страницу оплаты. Если вебхук
-    // подтвердит оплату, у нас уже есть все данные под рукой, не нужно
-    // ничего запрашивать у браузера покупателя.
     pendingOrders[orderNumber] = {
       orderNumber, phone: customerPhone || '', name: customerName || '', email: customerEmail || '',
       total: amount, items: items || [], delivery: deliveryLabel || delivery || '',
@@ -268,48 +168,25 @@ app.post('/tinkoff/init', async (req, res) => {
       ozonDeliveryPointId: ozonDeliveryPointId || null, cdekDeliveryPointCode: cdekDeliveryPointCode || null
     };
 
-    const SITE_URL = 'https://meusdomus.ru';
-    const SERVER_URL = 'https://meusdomus-tinkoff.onrender.com';
-
     const initParams = {
       TerminalKey: TERMINAL_KEY,
-      Amount: Math.round(amount * 100), // Тинькофф считает в копейках
+      Amount: Math.round(amount * 100),
       OrderId: orderNumber,
       Description: 'Заказ Meus Domus ' + orderNumber,
       DATA: { Phone: customerPhone || '', Name: customerName || '' },
       SuccessURL: SITE_URL + '/?payment=success',
       FailURL: SITE_URL + '/?payment=fail',
       NotificationURL: SERVER_URL + '/tinkoff/notify',
-      // ==================== ЧЕК ПО 54-ФЗ (Receipt) ====================
-      // НАЙДЕНА ТОЧНАЯ ПРИЧИНА ошибки "request.validate.expected.receipt":
-      // боевой (не тестовый) терминал Тинькофф ОБЯЗАН передавать данные для
-      // фискального чека в каждом запросе на оплату — это требование
-      // законодательства (54-ФЗ), а не прихоть банка. Без него платёж
-      // отклоняется полностью, ещё до попытки списать деньги.
-      //
-      // По данным заказчика: УСН 6% ("usn_income") + НДС по льготной ставке
-      // 5% для плательщиков УСН с доходом выше порога (действует с 2025 года).
-      //
-      // ВАЖНО — ставка НДС ниже указана как 'vat5' ПО АНАЛОГИИ с уже
-      // существующими значениями Тинькофф (vat0, vat10, vat20) — сама
-      // ставка 5% появилась в законе совсем недавно (2025 год), и я не
-      // нашёл однозначного официального подтверждения именно этого
-      // написания в документации Тинькофф (только примеры со старыми
-      // ставками 10%/20% в сторонних библиотеках). Если после этого
-      // изменения ошибка сменится на что-то про "invalid tax" или
-      // "неверное значение Tax" — значит, точное название всё же другое,
-      // и его нужно будет уточнить напрямую в поддержке Тинькофф Бизнеса
-      // или в актуальной документации в личном кабинете.
       Receipt: {
         Phone: customerPhone || undefined,
-        Taxation: 'usn_income', // УСН 6% — подтверждено заказчиком
+        Taxation: 'usn_income',
         Items: [
           {
             Name: 'Заказ Meus Domus ' + orderNumber,
             Price: Math.round(amount * 100),
             Quantity: 1.00,
             Amount: Math.round(amount * 100),
-            Tax: 'vat5' // ← НДС 5% — название по аналогии, см. комментарий выше
+            Tax: 'vat5'
           }
         ]
       }
@@ -320,9 +197,6 @@ app.post('/tinkoff/init', async (req, res) => {
     try {
       data = await postJson('https://securepay.tinkoff.ru/v2/Init', { ...initParams, Token: token });
     } catch (networkErr) {
-      // ВАЖНО: логируем максимально подробно — именно эта строка в логах
-      // Render покажет, если проблема повторится, что конкретно пошло не так
-      // при обращении к самому Тинькоффу (а не внутри нашего сервера)
       console.error('Не удалось связаться с Тинькофф Init API:', networkErr.message);
       return res.status(502).json({ error: 'Не удалось связаться с платёжным шлюзом Тинькофф. Попробуйте ещё раз через минуту.' });
     }
@@ -339,10 +213,6 @@ app.post('/tinkoff/init', async (req, res) => {
   }
 });
 
-// 2) Вебхук от Тинькофф: сюда прилетает подтверждение реальной оплаты.
-//    ЭТО единственный источник правды об оплате — статус на фронтенде
-//    (redirect на Success URL) использовать для отгрузки товара нельзя,
-//    его можно подделать вручную открыв ссылку.
 app.post('/tinkoff/notify', (req, res) => {
   const body = req.body;
   const receivedToken = body.Token;
@@ -357,34 +227,17 @@ app.post('/tinkoff/notify', (req, res) => {
 
   if (body.Status === 'CONFIRMED') {
     console.log('Оплачен заказ:', body.OrderId, 'сумма:', body.Amount / 100);
-    // ВАЖНО: отвечаем банку "OK" СРАЗУ (ниже), не дожидаясь записи в
-    // таблицу — Тинькофф ждёт быстрый ответ на вебхук и может посчитать
-    // его неудачным (и прислать повторно) при заметной задержке. Саму
-    // запись запускаем в фоне, не блокируя ответ банку.
     saveConfirmedOrderReliably(body.OrderId).catch(err => {
       console.error('Не удалось записать заказ по вебхуку:', body.OrderId, err.message || err);
     });
   }
 
-  // Тинькофф ждёт именно текст "OK" в ответ
   res.send('OK');
 });
 
-/**
- * Отправляет подтверждённый заказ в Google Таблицу — используя данные,
- * сохранённые ещё на шаге /tinkoff/init (до того, как покупатель вообще
- * увидел форму оплаты). Работает полностью независимо от браузера
- * покупателя — единственный источник правды здесь banк, не браузер.
- * Apps Script сам защищён от повторной записи одного и того же номера
- * заказа — можно не бояться, что этот путь и обычный (из браузера)
- * запишут заказ дважды.
- */
 async function saveConfirmedOrderReliably(orderId) {
   const pending = pendingOrders[orderId];
   if (!pending) {
-    // Сервер перезапускался между /init и этим вебхуком (см. пояснение
-    // выше про ограничение "хранилища в памяти") — тогда полагаемся на
-    // то, что браузер покупателя сам отправит заказ при возврате на сайт.
     console.warn('Нет сохранённых данных для заказа (сервер мог перезапуститься):', orderId);
     return;
   }
@@ -406,11 +259,9 @@ async function saveConfirmedOrderReliably(orderId) {
     cdekDeliveryPointCode: pending.cdekDeliveryPointCode
   });
 
-  delete pendingOrders[orderId]; // больше не нужно хранить — заказ успешно записан
+  delete pendingOrders[orderId];
 }
 
-// Простой диагностический маршрут — открыв его в браузере, можно быстро
-// проверить, что сервис вообще жив и отвечает (без обращения к Тинькофф)
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
