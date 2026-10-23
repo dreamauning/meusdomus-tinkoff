@@ -322,4 +322,71 @@ app.get('/health', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+let giftFonts = null;
+function giftFontFiles() {
+  if (giftFonts) return giftFonts;
+  giftFonts = [
+    '@expo-google-fonts/lora/600SemiBold/Lora_600SemiBold.ttf',
+    '@expo-google-fonts/manrope/600SemiBold/Manrope_600SemiBold.ttf',
+    '@expo-google-fonts/manrope/700Bold/Manrope_700Bold.ttf',
+    '@expo-google-fonts/manrope/800ExtraBold/Manrope_800ExtraBold.ttf'
+  ].map((f) => require.resolve(f));
+  return giftFonts;
+}
+
+function xmlEsc(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function giftCardSvg(o) {
+  const amount = String(Math.round(Number(o.amount) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + ' ₽';
+  const until = o.until ? new Date(o.until) : null;
+  const untilText = until && !isNaN(until.getTime()) ? 'Действует до ' + String(until.getDate()).padStart(2, '0') + '.' + String(until.getMonth() + 1).padStart(2, '0') + '.' + until.getFullYear() : '';
+  const toName = String(o.toName || '').trim().slice(0, 40);
+  const code = String(o.code || '').slice(0, 20);
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <defs>
+    <radialGradient id="bg" cx="1600" cy="0" r="1900" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6B4A2E"/>
+      <stop offset="0.55" stop-color="#2A1E15"/>
+      <stop offset="1" stop-color="#1A120C"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="1600" y2="1000" gradientUnits="userSpaceOnUse">
+      <stop offset="0.38" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.085"/>
+      <stop offset="0.62" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <clipPath id="clip"><rect x="0" y="0" width="1600" height="1000" rx="56"/></clipPath>
+  </defs>
+  <g clip-path="url(#clip)">
+    <rect width="1600" height="1000" fill="url(#bg)"/>
+    <rect width="1600" height="1000" fill="url(#sheen)"/>
+  </g>
+  <rect x="2" y="2" width="1596" height="996" rx="54" fill="none" stroke="#E7C989" stroke-opacity="0.28" stroke-width="3"/>
+  <text x="104" y="176" font-family="Lora" font-weight="600" font-size="46" letter-spacing="13" fill="#E7C989">MEUS DOMUS</text>
+  <g transform="translate(1396 104) scale(4.2)" fill="#E7C989" fill-opacity="0.9">
+    <ellipse cx="12" cy="16" rx="5" ry="4.2"/><ellipse cx="5.5" cy="10.5" rx="2.1" ry="2.6"/><ellipse cx="9.3" cy="6.6" rx="2.1" ry="2.8"/><ellipse cx="14.7" cy="6.6" rx="2.1" ry="2.8"/><ellipse cx="18.5" cy="10.5" rx="2.1" ry="2.6"/>
+  </g>
+  <text x="104" y="470" font-family="Manrope" font-weight="800" font-size="38" letter-spacing="5" fill="#CDBBA3">ПОДАРОЧНЫЙ СЕРТИФИКАТ</text>
+  <text x="98" y="632" font-family="Lora" font-weight="600" font-size="164" fill="#F3DDAA">${xmlEsc(amount)}</text>
+  ${toName ? `<text x="104" y="${untilText ? 852 : 896}" font-family="Manrope" font-weight="700" font-size="40" fill="#F6EFE6">Для: ${xmlEsc(toName)}</text>` : ''}
+  ${untilText ? `<text x="104" y="${toName ? 906 : 896}" font-family="Manrope" font-weight="600" font-size="31" fill="#BFAF9A">${xmlEsc(untilText)}</text>` : ''}
+  <text x="1496" y="896" text-anchor="end" font-family="Manrope" font-weight="800" font-size="50" letter-spacing="7" fill="#F6EFE6">${xmlEsc(code)}</text>
+</svg>`;
+}
+
+app.post('/gift-card', (req, res) => {
+  const b = req.body || {};
+  if (!SERVER_SECRET || b.key !== SERVER_SECRET) return res.status(403).json({ error: 'forbidden' });
+  try {
+    const { Resvg } = require('@resvg/resvg-js');
+    const png = new Resvg(giftCardSvg(b), { font: { fontFiles: giftFontFiles(), loadSystemFonts: false, defaultFontFamily: 'Manrope' }, fitTo: { mode: 'width', value: 1200 } }).render().asPng();
+    res.set('Content-Type', 'image/png');
+    return res.send(png);
+  } catch (err) {
+    console.error('Не удалось нарисовать сертификат:', err.message);
+    return res.status(500).json({ error: 'render' });
+  }
+});
+
 app.listen(PORT, () => console.log('Сервер оплаты запущен на порту ' + PORT + ', версия Node.js: ' + process.version));
