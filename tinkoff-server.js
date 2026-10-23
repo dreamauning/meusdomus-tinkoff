@@ -190,7 +190,8 @@ app.post('/tinkoff/init', async (req, res) => {
   try {
     const b = req.body || {};
     const items = Array.isArray(b.items) ? b.items.slice(0, 60) : [];
-    if (!items.length) return res.status(400).json({ error: 'Корзина пуста' });
+    const gift = b.gift && typeof b.gift === 'object' ? { amount: b.gift.amount, toName: b.gift.toName, toEmail: b.gift.toEmail, message: b.gift.message, fromName: b.gift.fromName } : null;
+    if (!items.length && !gift) return res.status(400).json({ error: 'Корзина пуста' });
 
     let prep;
     try {
@@ -200,7 +201,8 @@ app.post('/tinkoff/init', async (req, res) => {
         delivery: b.delivery, deliveryLabel: b.deliveryLabel, deliveryDestination: b.deliveryDestination, deliveryCost: b.deliveryCost,
         items: items.map((i) => ({ id: i.id, sku: i.sku, qty: i.qty, name: i.name, variant: i.variant, image: i.image, unitWeightGrams: i.unitWeightGrams })),
         weightGrams: b.weightGrams, dimensionsCm: b.dimensionsCm, ozonDeliveryPointId: b.ozonDeliveryPointId, cdekDeliveryPointCode: b.cdekDeliveryPointCode,
-        bonusRedeemed: b.bonusRedeemed, passwordHash: b.passwordHash, clientTotal: b.amount
+        bonusRedeemed: b.bonusRedeemed, passwordHash: b.passwordHash, clientTotal: b.amount,
+        gift: gift || undefined, giftCode: b.giftCode || undefined
       });
     } catch (sheetErr) {
       console.error('Таблица не ответила на checkout-prepare:', sheetErr.message);
@@ -210,12 +212,17 @@ app.post('/tinkoff/init', async (req, res) => {
       return res.status(409).json({ error: (prep && prep.error) || 'Не удалось подготовить заказ', code: prep && prep.code, total: prep && prep.total, prices: prep && prep.prices, problems: prep && prep.problems, allowed: prep && prep.allowed });
     }
 
+    if (prep.paid) {
+      return res.json({ paid: true, orderNumber: prep.orderNumber, amount: 0, giftApplied: prep.giftApplied || 0 });
+    }
+
     const amountKop = Math.round(prep.total * 100);
+    const title = gift ? 'Подарочный сертификат Meus Domus ' + prep.orderNumber : 'Заказ Meus Domus ' + prep.orderNumber;
     const initParams = {
       TerminalKey: TERMINAL_KEY,
       Amount: amountKop,
       OrderId: prep.orderNumber,
-      Description: 'Заказ Meus Domus ' + prep.orderNumber,
+      Description: title,
       DATA: { Phone: b.customerPhone || '', Name: b.customerName || '' },
       SuccessURL: SITE_URL + '/?payment=success',
       FailURL: SITE_URL + '/?payment=fail',
@@ -225,11 +232,12 @@ app.post('/tinkoff/init', async (req, res) => {
         Taxation: 'usn_income',
         Items: [
           {
-            Name: 'Заказ Meus Domus ' + prep.orderNumber,
+            Name: title,
             Price: amountKop,
             Quantity: 1.00,
             Amount: amountKop,
-            Tax: 'vat5'
+            Tax: 'vat5',
+            ...(gift ? { PaymentMethod: 'advance', PaymentObject: 'payment' } : {})
           }
         ]
       }
