@@ -1,6 +1,6 @@
 {
   "name": "meusdomus-tinkoff",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "engines": {
     "node": ">=18.0.0"
@@ -9,6 +9,9 @@
     "start": "node tinkoff-server.js"
   },
   "dependencies": {
+    "@expo-google-fonts/lora": "^0.4.2",
+    "@expo-google-fonts/manrope": "^0.4.2",
+    "@resvg/resvg-js": "^2.6.2",
     "express": "^4.19.2"
   }
 }
