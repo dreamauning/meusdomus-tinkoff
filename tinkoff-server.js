@@ -1,18 +1,19 @@
 const express = require('express');
 const crypto = require('crypto');
 const https = require('https');
+const http = require('http');
 const tls = require('tls');
 
 const TERMINAL_KEY = '1785336284647';
 const TERMINAL_PASSWORD = '2ir^%&_X35q$iWt_';
 const SITE_URL = 'https://meusdomus.ru';
 const SERVER_URL = 'https://meusdomus-tinkoff.onrender.com';
-const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
+const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL || 'https://script.google.com/macros/s/AKfycbyAKLI96MAXo4-6iOBSNjw9sX0xVQ2d35ZuGeDZmXSEljYUMCCDUaRgSPZy3TOQQYjB/exec';
+const TINKOFF_API = process.env.TINKOFF_API || 'https://securepay.tinkoff.ru/v2';
+const SERVER_SECRET = '8804b961cee24d6e8828c7541172140e1672b1b6';
 
 const app = express();
-app.use(express.json());
-
-const pendingOrders = {};
+app.use(express.json({ limit: '200kb' }));
 
 const RUSSIAN_TRUSTED_ROOT_CA = `-----BEGIN CERTIFICATE-----
 MIIFwjCCA6qgAwIBAgICEAAwDQYJKoZIhvcNAQELBQAwcDELMAkGA1UEBhMCUlUx
@@ -113,8 +114,10 @@ function postJson(url, bodyObj) {
   return new Promise((resolve, reject) => {
     const bodyStr = JSON.stringify(bodyObj);
     const urlObj = new URL(url);
+    const lib = urlObj.protocol === 'http:' ? http : https;
     const options = {
       hostname: urlObj.hostname,
+      port: urlObj.port || undefined,
       path: urlObj.pathname + urlObj.search,
       method: 'POST',
       headers: {
@@ -125,7 +128,7 @@ function postJson(url, bodyObj) {
       timeout: 15000
     };
 
-    const request = https.request(options, (response) => {
+    const request = lib.request(options, (response) => {
       let raw = '';
       response.on('data', (chunk) => { raw += chunk; });
       response.on('end', () => {
@@ -148,44 +151,84 @@ function postJson(url, bodyObj) {
   });
 }
 
+async function callSheet(body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 45000);
+  try {
+    const response = await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    const text = await response.text();
+    try { return JSON.parse(text); } catch (err) { throw new Error('Таблица ответила не JSON: ' + text.slice(0, 200)); }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function confirmPaid(orderNumber, amountRub, paymentId) {
+  const delays = [0, 3000, 10000, 30000, 90000];
+  let lastErr = null;
+  for (const delay of delays) {
+    if (delay) await sleep(delay);
+    try {
+      const result = await callSheet({ type: 'order-paid', key: SERVER_SECRET, orderNumber, amount: amountRub, paymentId: String(paymentId || '') });
+      if (result && result.success) return result;
+      lastErr = new Error((result && result.error) || 'нет ответа');
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
 app.post('/tinkoff/init', async (req, res) => {
   try {
-    const {
-      orderNumber, amount, customerName, customerPhone, customerEmail, comment,
-      delivery, deliveryLabel, deliveryDestination, items,
-      weightGrams, dimensionsCm, ozonDeliveryPointId, cdekDeliveryPointCode
-    } = req.body;
+    const b = req.body || {};
+    const items = Array.isArray(b.items) ? b.items.slice(0, 60) : [];
+    if (!items.length) return res.status(400).json({ error: 'Корзина пуста' });
 
-    if (!orderNumber || !amount || amount <= 0) {
-      return res.status(400).json({ error: 'Некорректные данные заказа' });
+    let prep;
+    try {
+      prep = await callSheet({
+        type: 'checkout-prepare',
+        name: b.customerName, phone: b.customerPhone, email: b.customerEmail, comment: b.comment,
+        delivery: b.delivery, deliveryLabel: b.deliveryLabel, deliveryDestination: b.deliveryDestination, deliveryCost: b.deliveryCost,
+        items: items.map((i) => ({ id: i.id, sku: i.sku, qty: i.qty, name: i.name, variant: i.variant, image: i.image, unitWeightGrams: i.unitWeightGrams })),
+        weightGrams: b.weightGrams, dimensionsCm: b.dimensionsCm, ozonDeliveryPointId: b.ozonDeliveryPointId, cdekDeliveryPointCode: b.cdekDeliveryPointCode,
+        bonusRedeemed: b.bonusRedeemed, passwordHash: b.passwordHash, clientTotal: b.amount
+      });
+    } catch (sheetErr) {
+      console.error('Таблица не ответила на checkout-prepare:', sheetErr.message);
+      return res.status(502).json({ error: 'Магазин не ответил — попробуйте ещё раз через минуту.' });
+    }
+    if (!prep || !prep.success) {
+      return res.status(409).json({ error: (prep && prep.error) || 'Не удалось подготовить заказ', code: prep && prep.code, total: prep && prep.total, prices: prep && prep.prices, problems: prep && prep.problems, allowed: prep && prep.allowed });
     }
 
-    pendingOrders[orderNumber] = {
-      orderNumber, phone: customerPhone || '', name: customerName || '', email: customerEmail || '',
-      total: amount, items: items || [], delivery: deliveryLabel || delivery || '',
-      deliveryDestination: deliveryDestination || '', comment: comment || '',
-      weightGrams: weightGrams || null, dimensionsCm: dimensionsCm || null,
-      ozonDeliveryPointId: ozonDeliveryPointId || null, cdekDeliveryPointCode: cdekDeliveryPointCode || null
-    };
-
+    const amountKop = Math.round(prep.total * 100);
     const initParams = {
       TerminalKey: TERMINAL_KEY,
-      Amount: Math.round(amount * 100),
-      OrderId: orderNumber,
-      Description: 'Заказ Meus Domus ' + orderNumber,
-      DATA: { Phone: customerPhone || '', Name: customerName || '' },
+      Amount: amountKop,
+      OrderId: prep.orderNumber,
+      Description: 'Заказ Meus Domus ' + prep.orderNumber,
+      DATA: { Phone: b.customerPhone || '', Name: b.customerName || '' },
       SuccessURL: SITE_URL + '/?payment=success',
       FailURL: SITE_URL + '/?payment=fail',
       NotificationURL: SERVER_URL + '/tinkoff/notify',
       Receipt: {
-        Phone: customerPhone || undefined,
+        Phone: b.customerPhone || undefined,
         Taxation: 'usn_income',
         Items: [
           {
-            Name: 'Заказ Meus Domus ' + orderNumber,
-            Price: Math.round(amount * 100),
+            Name: 'Заказ Meus Domus ' + prep.orderNumber,
+            Price: amountKop,
             Quantity: 1.00,
-            Amount: Math.round(amount * 100),
+            Amount: amountKop,
             Tax: 'vat5'
           }
         ]
@@ -195,7 +238,7 @@ app.post('/tinkoff/init', async (req, res) => {
 
     let data;
     try {
-      data = await postJson('https://securepay.tinkoff.ru/v2/Init', { ...initParams, Token: token });
+      data = await postJson(TINKOFF_API + '/Init', { ...initParams, Token: token });
     } catch (networkErr) {
       console.error('Не удалось связаться с Тинькофф Init API:', networkErr.message);
       return res.status(502).json({ error: 'Не удалось связаться с платёжным шлюзом Тинькофф. Попробуйте ещё раз через минуту.' });
@@ -206,7 +249,7 @@ app.post('/tinkoff/init', async (req, res) => {
       return res.status(502).json({ error: data.Message || 'Ошибка платёжного шлюза' });
     }
 
-    return res.json({ paymentUrl: data.PaymentURL });
+    return res.json({ paymentUrl: data.PaymentURL, orderNumber: prep.orderNumber, amount: prep.total });
   } catch (err) {
     console.error('Внутренняя ошибка в /tinkoff/init:', err);
     return res.status(500).json({ error: 'Внутренняя ошибка сервера' });
@@ -214,7 +257,7 @@ app.post('/tinkoff/init', async (req, res) => {
 });
 
 app.post('/tinkoff/notify', (req, res) => {
-  const body = req.body;
+  const body = req.body || {};
   const receivedToken = body.Token;
   const check = { ...body };
   delete check.Token;
@@ -227,7 +270,7 @@ app.post('/tinkoff/notify', (req, res) => {
 
   if (body.Status === 'CONFIRMED') {
     console.log('Оплачен заказ:', body.OrderId, 'сумма:', body.Amount / 100);
-    saveConfirmedOrderReliably(body.OrderId).catch(err => {
+    confirmPaid(body.OrderId, body.Amount / 100, body.PaymentId).catch((err) => {
       console.error('Не удалось записать заказ по вебхуку:', body.OrderId, err.message || err);
     });
   }
@@ -235,32 +278,36 @@ app.post('/tinkoff/notify', (req, res) => {
   res.send('OK');
 });
 
-async function saveConfirmedOrderReliably(orderId) {
-  const pending = pendingOrders[orderId];
-  if (!pending) {
-    console.warn('Нет сохранённых данных для заказа (сервер мог перезапуститься):', orderId);
-    return;
+const recentChecks = new Map();
+
+app.post('/tinkoff/check', async (req, res) => {
+  const orderNumber = String((req.body && req.body.orderNumber) || '').trim();
+  if (!/^MD-\d{3,10}$/.test(orderNumber)) return res.status(400).json({ error: 'Некорректный номер заказа' });
+  const last = recentChecks.get(orderNumber) || 0;
+  if (Date.now() - last < 2500) return res.status(429).json({ error: 'Подождите пару секунд' });
+  recentChecks.set(orderNumber, Date.now());
+  if (recentChecks.size > 5000) recentChecks.clear();
+  try {
+    const params = { TerminalKey: TERMINAL_KEY, OrderId: orderNumber };
+    const data = await postJson(TINKOFF_API + '/CheckOrder', { ...params, Token: buildToken(params) });
+    const payments = Array.isArray(data && data.Payments) ? data.Payments : [];
+    const confirmed = payments.find((p) => p.Status === 'CONFIRMED');
+    if (confirmed) {
+      try {
+        await confirmPaid(orderNumber, Number(confirmed.Amount) / 100, confirmed.PaymentId);
+      } catch (err) {
+        console.error('Оплата подтверждена банком, но запись не удалась:', orderNumber, err.message || err);
+      }
+      return res.json({ paid: true });
+    }
+    const statuses = payments.map((p) => p.Status);
+    const failed = statuses.length > 0 && statuses.every((s) => ['REJECTED', 'CANCELED', 'DEADLINE_EXPIRED', 'REVERSED', 'REFUNDED'].indexOf(s) !== -1);
+    return res.json({ paid: false, failed, status: statuses[statuses.length - 1] || '' });
+  } catch (err) {
+    console.error('CheckOrder не удался:', orderNumber, err.message || err);
+    return res.status(502).json({ error: 'Банк не ответил' });
   }
-
-  await postJson(APPS_SCRIPT_URL, {
-    type: 'order',
-    orderNumber: pending.orderNumber,
-    phone: pending.phone,
-    name: pending.name,
-    email: pending.email,
-    total: pending.total,
-    items: pending.items,
-    delivery: pending.delivery,
-    deliveryDestination: pending.deliveryDestination,
-    comment: pending.comment,
-    weightGrams: pending.weightGrams,
-    dimensionsCm: pending.dimensionsCm,
-    ozonDeliveryPointId: pending.ozonDeliveryPointId,
-    cdekDeliveryPointCode: pending.cdekDeliveryPointCode
-  });
-
-  delete pendingOrders[orderId];
-}
+});
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
